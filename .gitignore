@@ -1,0 +1,13 @@
+# O parquet acumulado NAO vai pro git: ele vive como asset da Release "data-store".
+data/
+*.parquet
+
+# Downloads brutos temporarios da StatCan
+data_raw/
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.python-version
