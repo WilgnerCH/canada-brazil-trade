@@ -1,5 +1,6 @@
 # O parquet acumulado NAO vai pro git: ele vive como asset da Release "data-store".
 data/
+!site/data/
 *.parquet
 
 # Downloads brutos temporarios da StatCan
