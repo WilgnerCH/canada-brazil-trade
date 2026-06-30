@@ -42,8 +42,10 @@ PARQUET_PATH = Path(os.environ.get("PARQUET_PATH", "data/canada_trade_full.parqu
 RAW_DIR = Path("data_raw")
 DEMO = os.environ.get("DEMO", "1") == "1"
 
-# Primeiro ano disponivel no CIMT para este formato (verificado: 2014 ok)
-FIRST_YEAR = 2014
+# Ano inicial da serie historica.
+# 2019: primeiro ano com lookup de pais completo (ODPF_6_CtyDesc.TXT ausente em 2014-2018).
+# Para reincluir anos anteriores basta diminuir este valor (dados disponiveis desde 2014).
+START_YEAR = 2019
 
 _BASE_URL = "https://www150.statcan.gc.ca/n1/pub/71-607-x/2021004/zip"
 
@@ -70,7 +72,7 @@ def anos_a_baixar(meses_existentes: set[str]) -> list[int]:
     hoje = date.today()
     ano_atual = hoje.year
     anos = []
-    for ano in range(FIRST_YEAR, ano_atual + 1):
+    for ano in range(START_YEAR, ano_atual + 1):
         if ano < ano_atual:
             esperados = {f"{ano}-{m:02d}" for m in range(1, 13)}
             if not esperados.issubset(meses_existentes):
