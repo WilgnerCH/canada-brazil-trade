@@ -1,65 +1,307 @@
 """
 analytics/aggregate.py
-----------------------
-Le o parquet acumulado e gera os CSVs que o dashboard consome em site/data_csv/.
-O dashboard (site/index.html) le esses CSVs por caminho RELATIVO (./data_csv/...),
-entao funciona em qualquer conta/repo no GitHub Pages.
+-----------------------
+Le o parquet acumulado e gera TODOS os arquivos que o dashboard consome:
+  site/data/*.json    (lidos diretamente pelo site/index.html via fetch)
+  site/data_csv/*.csv (espelho CSV dos JSONs, para analise externa)
 
-Hoje gera monthly.csv (exportacoes/importacoes/saldo por mes). Os outros recortes
-(paises, produtos/HS2, provincias, matriz Brasil) entram aqui da mesma forma:
-um groupby -> um to_csv. Veja os TODO no fim.
+Suporta dois schemas:
+  Schema CIMT (producao): date, trade_type, hs2, country_code, country_name, province, value_cad
+  Schema simplificado (DEMO): date, trade_type, country_name, value_cad
+
+Arquivos gerados:
+  monthly.{json,csv}               totais mensais (exports, imports, balance)
+  countries.{json,csv}             totais por pais (top N)
+  countries_monthly.{json,csv}     serie mensal dos top N paises
+  commodities.{json,csv}           totais por capitulo HS2
+  commodities_monthly.{json,csv}   serie mensal dos top N capitulos HS2
+  provinces.{json,csv}             totais por provincia (importacoes, ultimos 12 meses)
+  provinces_commodities.{json,csv} provincia x HS2 (importacoes, ultimos 12 meses)
+  metadata.{json,csv}              metadados do dataset
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+LOG = logging.getLogger(__name__)
+
 PARQUET_PATH = Path(os.environ.get("PARQUET_PATH", "data/canada_trade_full.parquet"))
-OUT_DIR = Path("site/data_csv")
+JSON_DIR = Path("site/data")
+CSV_DIR  = Path("site/data_csv")
+TOP_N    = 20
+
+HS2_NAMES: dict[str, str] = {
+    "01": "Live animals", "02": "Meat & offal", "03": "Fish & seafood",
+    "04": "Dairy products", "05": "Other animal products", "06": "Live trees & plants",
+    "07": "Vegetables", "08": "Fruit & nuts", "09": "Coffee, tea & spices",
+    "10": "Cereals", "11": "Milling products", "12": "Oil seeds",
+    "13": "Resins & gums", "14": "Vegetable materials", "15": "Animal/veg fats & oils",
+    "16": "Prepared meat & fish", "17": "Sugars", "18": "Cocoa & cocoa products",
+    "19": "Prepared cereals", "20": "Prepared vegetables", "21": "Misc food preparations",
+    "22": "Beverages & spirits", "23": "Food industry residues", "24": "Tobacco",
+    "25": "Salt, sulphur, stone, cement", "26": "Ores, slag & ash",
+    "27": "Mineral fuels & oils", "28": "Inorganic chemicals",
+    "29": "Organic chemicals", "30": "Pharmaceuticals", "31": "Fertilizers",
+    "32": "Tanning & dye extracts", "33": "Cosmetics & perfumes",
+    "34": "Soap & cleaning products", "35": "Protein substances",
+    "36": "Explosives", "37": "Photographic goods", "38": "Misc chemical products",
+    "39": "Plastics", "40": "Rubber", "41": "Raw hides & skins", "42": "Leather goods",
+    "43": "Furskins", "44": "Wood & wood articles", "45": "Cork", "46": "Basketware",
+    "47": "Wood pulp", "48": "Paper & paperboard", "49": "Printed books & media",
+    "50": "Silk", "51": "Wool", "52": "Cotton", "53": "Vegetable textile fibres",
+    "54": "Man-made filaments", "55": "Man-made staple fibres", "56": "Wadding & felt",
+    "57": "Carpets", "58": "Special woven fabrics", "59": "Coated textiles",
+    "60": "Knitted fabrics", "61": "Knitted apparel", "62": "Woven apparel",
+    "63": "Other made-up textiles", "64": "Footwear", "65": "Headgear",
+    "66": "Umbrellas", "67": "Feathers & artificial flowers",
+    "68": "Stone & cement articles", "69": "Ceramic products", "70": "Glass",
+    "71": "Precious metals & stones", "72": "Iron & steel",
+    "73": "Articles of iron & steel", "74": "Copper", "75": "Nickel",
+    "76": "Aluminium", "78": "Lead", "79": "Zinc", "80": "Tin", "81": "Other base metals",
+    "82": "Tools & cutlery", "83": "Miscellaneous metal articles",
+    "84": "Machinery & mechanical appliances", "85": "Electrical equipment",
+    "86": "Railway equipment", "87": "Vehicles", "88": "Aircraft & spacecraft",
+    "89": "Ships & boats", "90": "Optical & medical instruments",
+    "91": "Clocks & watches", "92": "Musical instruments",
+    "93": "Arms & ammunition", "94": "Furniture", "95": "Toys & sports equipment",
+    "96": "Miscellaneous manufactures", "97": "Works of art",
+    "98": "Special transactions (CA)", "99": "Confidential / low-value (CA)",
+}
+
+PROVINCE_DISPLAY: dict[str, str] = {
+    "AB": "Alberta", "BC": "British Columbia", "MB": "Manitoba",
+    "NB": "New Brunswick", "NL": "Newfoundland & Labrador",
+    "NT": "Northwest Territories", "NS": "Nova Scotia", "NU": "Nunavut",
+    "ON": "Ontario", "PE": "Prince Edward Island",
+    "QC": "Quebec", "SK": "Saskatchewan", "YT": "Yukon",
+}
 
 
-def gerar_monthly(df: pd.DataFrame) -> None:
-    """Exportacoes x importacoes x saldo por mes (relacao Canada<->Brasil)."""
-    piv = (
-        df.pivot_table(index="month", columns="flow", values="value_cad", aggfunc="sum")
-        .fillna(0)
+# ── Schema normalisation ──────────────────────────────────────────────────────
+
+def _normalizar(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Garante schema padrao para aggregacoes.
+    Detecta e normaliza schema simplificado (DEMO) se necessario.
+    """
+    df = df.copy()
+
+    # Schema DEMO (month/flow)
+    if "month" in df.columns:
+        df = df.rename(columns={"month": "date"})
+    if "flow" in df.columns:
+        df["trade_type"] = df["flow"].str.capitalize()
+
+    # Garante coluna 'partner' (nome do pais para display)
+    if "country_name" in df.columns and "partner" not in df.columns:
+        df["partner"] = df["country_name"]
+    elif "partner" not in df.columns:
+        df["partner"] = "Unknown"
+
+    # Garante coluna 'commodity' (nome HS2 para display)
+    if "hs2" in df.columns and "commodity" not in df.columns:
+        df["commodity"] = df["hs2"].map(HS2_NAMES).fillna(
+            df["hs2"].apply(lambda x: f"HS {x}")
+        )
+    elif "commodity" not in df.columns:
+        df["commodity"] = "Total"
+
+    df["value_cad"] = pd.to_numeric(df["value_cad"], errors="coerce").fillna(0).astype("int64")
+    return df
+
+
+# ── Aggregation helpers ────────────────────────────────────────────────────────
+
+def _pivot_tt(df: pd.DataFrame, idx: list[str]) -> pd.DataFrame:
+    """Pivot trade_type (Import/Export) into columns."""
+    return (
+        df.groupby(idx + ["trade_type"])["value_cad"]
+        .sum()
+        .unstack("trade_type", fill_value=0)
         .reset_index()
-        .sort_values("month")
     )
-    piv = piv.rename(columns={"export": "exports_cad", "import": "imports_cad"})
-    for col in ("exports_cad", "imports_cad"):
-        if col not in piv.columns:
-            piv[col] = 0
-    piv["balance_cad"] = piv["exports_cad"] - piv["imports_cad"]
-    out = OUT_DIR / "monthly.csv"
-    piv.to_csv(out, index=False)
-    print(f"[aggregate] {out} ({len(piv)} linha(s)).")
 
+
+def _records(pivot: pd.DataFrame, idx_cols: list[str]) -> list[dict]:
+    rows = []
+    for _, row in pivot.iterrows():
+        imp = int(row.get("Import", 0))
+        exp = int(row.get("Export", 0))
+        rec = {c: str(row[c]) if not isinstance(row[c], (int, float)) else row[c]
+               for c in idx_cols}
+        rec.update(imports=imp, exports=exp, total=imp + exp)
+        rows.append(rec)
+    return rows
+
+
+# ── Builders ──────────────────────────────────────────────────────────────────
+
+def build_monthly(df: pd.DataFrame) -> list[dict]:
+    pivot = _pivot_tt(df, ["date"])
+    result = []
+    for _, row in pivot.iterrows():
+        imp = int(row.get("Import", 0))
+        exp = int(row.get("Export", 0))
+        result.append({"date": str(row["date"]), "imports": imp,
+                       "exports": exp, "balance": exp - imp})
+    return sorted(result, key=lambda r: r["date"])
+
+
+def build_countries(df: pd.DataFrame) -> list[dict]:
+    pivot = _pivot_tt(df, ["partner"])
+    return sorted(_records(pivot, ["partner"]), key=lambda r: -r["total"])
+
+
+def build_countries_monthly(df: pd.DataFrame) -> list[dict]:
+    top = df.groupby("partner")["value_cad"].sum().nlargest(TOP_N).index.tolist()
+    pivot = _pivot_tt(df[df["partner"].isin(top)], ["date", "partner"])
+    return sorted(_records(pivot, ["date", "partner"]),
+                  key=lambda r: (r["date"], -r["total"]))
+
+
+def build_commodities(df: pd.DataFrame) -> list[dict]:
+    if "commodity" not in df.columns or df["commodity"].eq("Total").all():
+        return []
+    pivot = _pivot_tt(df, ["commodity"])
+    return sorted(_records(pivot, ["commodity"]), key=lambda r: -r["total"])
+
+
+def build_commodities_monthly(df: pd.DataFrame) -> list[dict]:
+    if "commodity" not in df.columns or df["commodity"].eq("Total").all():
+        return []
+    top = df.groupby("commodity")["value_cad"].sum().nlargest(TOP_N).index.tolist()
+    pivot = _pivot_tt(df[df["commodity"].isin(top)], ["date", "commodity"])
+    return sorted(_records(pivot, ["date", "commodity"]),
+                  key=lambda r: (r["date"], -r["total"]))
+
+
+def build_provinces(df: pd.DataFrame) -> list[dict]:
+    """Importacoes por provincia — janela dos ultimos 12 meses."""
+    if "province" not in df.columns:
+        return []
+    imp = df[
+        (df["trade_type"] == "Import") &
+        df["province"].notna() &
+        (df["province"].astype(str).str.strip() != "") &
+        (df["province"].astype(str) != "None")
+    ].copy()
+    if imp.empty:
+        return []
+
+    max_date   = imp["date"].max()
+    max_period = pd.Period(max_date, "M")
+    min_period = max_period - 11
+    imp = imp[(imp["date"] >= str(min_period)) & (imp["date"] <= max_date)]
+
+    agg = imp.groupby("province")["value_cad"].sum().reset_index()
+    agg.columns = ["code", "imports"]
+    agg["name"] = agg["code"].map(PROVINCE_DISPLAY).fillna(agg["code"])
+    agg["exports"] = 0
+    agg["total"] = agg["imports"]
+    agg["period_start"] = str(min_period)
+    agg["period_end"]   = str(max_period)
+    return sorted(agg.to_dict("records"), key=lambda r: -r["total"])
+
+
+def build_provinces_commodities(df: pd.DataFrame) -> list[dict]:
+    """Importacoes por provincia x HS2 — janela dos ultimos 12 meses."""
+    if "province" not in df.columns or "hs2" not in df.columns:
+        return []
+    imp = df[
+        (df["trade_type"] == "Import") &
+        df["province"].notna() &
+        (df["province"].astype(str).str.strip() != "") &
+        (df["province"].astype(str) != "None")
+    ].copy()
+    if imp.empty:
+        return []
+
+    max_date   = imp["date"].max()
+    max_period = pd.Period(max_date, "M")
+    min_period = max_period - 11
+    imp = imp[(imp["date"] >= str(min_period)) & (imp["date"] <= max_date)]
+
+    agg = imp.groupby(["province", "hs2"])["value_cad"].sum().reset_index()
+    agg.columns = ["code", "hs2", "imports"]
+    agg["commodity"] = agg["hs2"].map(HS2_NAMES).fillna(agg["hs2"].apply(lambda x: f"HS {x}"))
+    agg["exports"] = 0
+    agg["total"] = agg["imports"]
+    return sorted(agg.to_dict("records"), key=lambda r: (-r["total"], r["code"]))
+
+
+def build_metadata(df: pd.DataFrame) -> dict:
+    return {
+        "last_updated":  datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "data_source":   "Statistics Canada — CIMT (customs basis, total exports incl. re-exports)",
+        "first_period":  str(df["date"].min()),
+        "last_period":   str(df["date"].max()),
+        "total_rows":    int(len(df)),
+    }
+
+
+# ── Save helpers ──────────────────────────────────────────────────────────────
+
+def _save_json(obj: object, name: str) -> None:
+    path = JSON_DIR / name
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
+    n = len(obj) if isinstance(obj, list) else len(obj) if isinstance(obj, dict) else "?"
+    LOG.info("  %-45s (%s items)", str(path), n)
+
+
+def _save_csv(obj: list[dict] | dict, name: str) -> None:
+    path = CSV_DIR / name
+    if isinstance(obj, dict):
+        obj = [obj]
+    if not obj:
+        return
+    pd.DataFrame(obj).to_csv(path, index=False)
+    LOG.info("  %-45s (%d rows)", str(path), len(obj))
+
+
+def _save(obj: object, stem: str) -> None:
+    _save_json(obj, f"{stem}.json")
+    _save_csv(obj, f"{stem}.csv")   # type: ignore[arg-type]
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
     if not PARQUET_PATH.exists():
-        print("[aggregate] Parquet inexistente. Nada a agregar.")
+        LOG.warning("[aggregate] Parquet nao encontrado em %s. Nada a gerar.", PARQUET_PATH)
         return
 
-    df = pd.read_parquet(PARQUET_PATH)
-    print(f"[aggregate] {len(df)} linha(s) carregada(s).")
+    JSON_DIR.mkdir(parents=True, exist_ok=True)
+    CSV_DIR.mkdir(parents=True, exist_ok=True)
 
-    gerar_monthly(df)
+    raw = pd.read_parquet(PARQUET_PATH)
+    LOG.info("[aggregate] %d linha(s) carregada(s). Colunas: %s", len(raw), list(raw.columns))
 
-    # TODO: replicar o padrao acima para os demais CSVs do dashboard, reaproveitando
-    # a sua logica de agregacao do repo canada-trade-kpi-lab (src/):
-    #   - countries.csv         (groupby partner)
-    #   - products.csv          (groupby HS2, via hs_lookup)
-    #   - provinces.csv,
-    #     provinces_monthly.csv,
-    #     provinces_hs2.csv      (groupby provincia)
-    #   - brazil_opportunity.csv (matriz de oportunidade)
-    # Cada um e: df.groupby(...).sum() -> .to_csv(OUT_DIR / "<nome>.csv").
+    df = _normalizar(raw)
+
+    LOG.info("[aggregate] Gerando arquivos de dashboard…")
+    _save(build_monthly(df),             "monthly")
+    _save(build_countries(df),           "countries")
+    _save(build_countries_monthly(df),   "countries_monthly")
+    _save(build_commodities(df),         "commodities")
+    _save(build_commodities_monthly(df), "commodities_monthly")
+    _save(build_provinces(df),           "provinces")
+    _save(build_provinces_commodities(df), "provinces_commodities")
+
+    # metadata so em JSON
+    meta = build_metadata(df)
+    _save_json(meta, "metadata.json")
+    _save_csv([meta], "metadata.csv")
+
+    LOG.info("[aggregate] Done.")
 
 
 if __name__ == "__main__":
