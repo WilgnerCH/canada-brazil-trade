@@ -13,6 +13,27 @@ repositórios.
 
 ---
 
+## Série histórica e recorte temporal
+
+A extração cobre **2019-01 em diante** (configurável via `START_YEAR` em
+`pipeline/extract.py`).
+
+O recorte começa em 2019 porque o arquivo de lookup de países
+(`ODPF_6_CtyDesc.TXT`) está ausente nos ZIPs CIMT de 2014–2018, fazendo com
+que os registros desses anos não tenham nome de país — apenas o código
+ISO de 2 letras. A série de 2019+ tem atribuição de país completa (262 países
+mapeados). Para reincluir os anos anteriores, basta alterar a constante:
+
+```python
+# pipeline/extract.py
+START_YEAR = 2019   # ← mudar para 2014 para reincluir 2014-2018
+```
+
+Dados disponíveis na StatCan desde 2014. Reconciliação confirmada com
+**gap = 0 CAD (0,00%)** em todos os meses de 2019-01 a 2026-04.
+
+---
+
 ## Como funciona (um job, em ordem)
 
 O workflow `.github/workflows/update.yml` roda todo mês e executa:
@@ -21,15 +42,16 @@ O workflow `.github/workflows/update.yml` roda todo mês e executa:
 2. **Extrai** da Statistics Canada só os meses que ainda faltam (incremental).
 3. **Mescla** os dados novos no parquet (*merge*, nunca *overwrite*).
 4. **Persiste** o parquet de volta na Release.
-5. **Agrega** o parquet nos CSVs do dashboard (`site/data_csv/*.csv`).
-6. **Commita** os CSVs atualizados.
+5. **Agrega** o parquet em JSON + CSV do dashboard (`site/data/` e `site/data_csv/`).
+6. **Commita** os dados atualizados.
 7. **Publica** a pasta `site/` no GitHub Pages.
 
 ```
 StatCan ──► extract.py ──► transform.py ──► [parquet na Release]
                                                │
                                                ▼
-                                         aggregate.py ──► site/data_csv/*.csv
+                                         aggregate.py ──► site/data/*.json
+                                                          site/data_csv/*.csv
                                                                │
                                                                ▼
                                                          GitHub Pages
@@ -68,25 +90,17 @@ Pronto: a partir daqui, com a máquina desligada, o site se atualiza sozinho tod
 
 ---
 
-## Ligando a lógica real (saindo do modo DEMO)
+## Modo DEMO vs. dados reais
 
-Enquanto `DEMO=1`, nada de internet é acessado — é só para validar o encanamento.
-Para colocar os dados reais:
+`DEMO=0` (padrão atual) — extrai dados reais da StatCan (CIMT).  
+`DEMO=1` — usa dados sintéticos para testar o encanamento sem acesso à internet.
 
-1. **`pipeline/extract.py`** → preencha `baixar_real()` com a extração da StatCan
-   do antigo `canada-trade-data` (URLs dos ZIPs, `CNAMES`, `hs_lookup`). Grave
-   cada mês em `data_raw/<mes>.parquet` com a coluna `month` (YYYY-MM) e
-   `row_type`.
-2. **`analytics/aggregate.py`** → replique o `gerar_monthly()` para os demais
-   CSVs (países, HS2, províncias, matriz Brasil), reaproveitando o `src/` do
-   `canada-trade-kpi-lab`.
-3. **`site/`** → troque a página de teste pelo seu dashboard real (o `index.html`
-   + `data_csv/` do `canada-trade-kpi-lab`). **Mantenha os caminhos dos CSVs
-   relativos** (`./data_csv/...`) para funcionar em qualquer conta.
-4. No `update.yml`, troque **`DEMO: "1"` para `DEMO: "0"`**.
+Para voltar ao modo sintético temporariamente, edite `update.yml`:
 
-> Se você usa `=IMPORTDATA()` no Google Sheets, atualize as URLs para apontar
-> aos CSVs deste repositório novo.
+```yaml
+env:
+  DEMO: "1"
+```
 
 ---
 

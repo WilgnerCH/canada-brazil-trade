@@ -36,10 +36,8 @@ permissions:
   id-token: write           # exigido pelo deploy-pages
 
 env:
-  # Enquanto a extracao real da StatCan nao estiver colada em pipeline/extract.py,
-  # deixe DEMO=1: o pipeline roda com dados sinteticos e voce ja ve TUDO verde
-  # (incluindo o Pages). Quando colar a logica real, troque para DEMO=0.
-  DEMO: "1"
+  # DEMO=0: extracao real da StatCan (CIMT). Para voltar ao modo sintetico: DEMO=1.
+  DEMO: "0"
   RELEASE_TAG: "data-store"
   PARQUET_PATH: "data/canada_trade_full.parquet"
 
@@ -93,12 +91,9 @@ jobs:
             || true
           gh release upload "$RELEASE_TAG" "$PARQUET_PATH" --clobber
 
-      # ---- 5. Gera os CSVs e JSONs que o dashboard le -------------------------
-      - name: Agregar -> CSVs
+      # ---- 5. Gera CSVs e JSONs que o dashboard le ----------------------------
+      - name: Agregar -> dados do dashboard (JSON + CSV)
         run: python analytics/aggregate.py
-
-      - name: Gerar JSONs do dashboard
-        run: python analytics/build_dashboard_data.py
 
       # ---- 6. Commita CSVs e JSONs atualizados --------------------------------
       - name: Commitar CSVs e JSONs
